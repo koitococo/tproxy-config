@@ -12,6 +12,7 @@ readme = "readme.md"
 [features]
 default = []
 unsafe-state-file = []
+log = []
 
 [dependencies]
 cidr = { version = "0.2", features = ["serde"] }
