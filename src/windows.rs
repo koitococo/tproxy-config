@@ -15,7 +15,6 @@ pub fn tproxy_setup(tproxy_args: &TproxyArgs) -> std::io::Result<TproxyState> {
     };
     let gateway = tproxy_args.tun_gateway.to_string();
     let args = &["add", &unspecified, "mask", &unspecified, &gateway, "metric", "6"];
-    #[cfg(feature = "log")]
     log::info!("route {:?}", args);
     run_command("route", args)?;
 
@@ -33,7 +32,6 @@ pub fn tproxy_setup(tproxy_args: &TproxyArgs) -> std::io::Result<TproxyState> {
     // command: `netsh interface ip set dns "utun3" static 10.0.0.1`
     let tun_name = format!("\"{}\"", tproxy_args.tun_name);
     let args = &["interface", "ip", "set", "dns", &tun_name, "static", &gateway];
-    #[cfg(feature = "log")]
     log::info!("netsh {:?}", args);
     run_command("netsh", args)?;
 
@@ -46,6 +44,7 @@ pub fn tproxy_setup(tproxy_args: &TproxyArgs) -> std::io::Result<TproxyState> {
         restore_resolvconf_content: None,
         tproxy_removed_done: false,
     };
+    #[cfg(feature = "unsafe-state-file")]
     crate::store_intermediate_state(&state)?;
 
     Ok(state)
@@ -55,7 +54,6 @@ fn do_bypass_ip(bypass_ip: cidr::IpCidr, original_gateway: IpAddr) -> std::io::R
     // route the bypass ip to the original gateway
     // command: `route add bypass_ip/24 original_gateway metric 1`
     let args = &["add", &bypass_ip.to_string(), &original_gateway.to_string(), "metric", "1"];
-    #[cfg(feature = "log")]
     log::info!("route {:?}", args);
     run_command("route", args)?;
     Ok(())
@@ -63,21 +61,24 @@ fn do_bypass_ip(bypass_ip: cidr::IpCidr, original_gateway: IpAddr) -> std::io::R
 
 impl Drop for TproxyState {
     fn drop(&mut self) {
-        #[cfg(feature = "log")]
         log::debug!("restoring network settings");
         if let Err(_e) = _tproxy_remove(self) {
-            #[cfg(feature = "log")]
             log::error!("failed to restore network settings: {}", _e);
         }
     }
 }
 
-pub fn tproxy_remove(tproxy_state: Option<TproxyState>) -> std::io::Result<()> {
-    let mut state = match tproxy_state {
-        Some(state) => state,
-        None => crate::retrieve_intermediate_state()?,
-    };
-    _tproxy_remove(&mut state)
+pub fn tproxy_remove(state: Option<TproxyState>) -> std::io::Result<()> {
+    match state {
+        Some(mut state) => _tproxy_remove(&mut state),
+        None => {
+            #[cfg(feature = "unsafe-state-file")]
+            if let Ok(mut state) = crate::retrieve_intermediate_state() {
+                _tproxy_remove(&mut state)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn _tproxy_remove(state: &mut TproxyState) -> std::io::Result<()> {
@@ -97,7 +98,6 @@ fn _tproxy_remove(state: &mut TproxyState) -> std::io::Result<()> {
     let gateway = tproxy_args.tun_gateway.to_string();
     let args = &["-p", "delete", &unspecified, "mask", &unspecified, &gateway];
     if let Err(_err) = run_command("route", args) {
-        #[cfg(feature = "log")]
         log::debug!("command \"route {:?}\" error: {}", args, _err);
     }
 
@@ -106,7 +106,6 @@ fn _tproxy_remove(state: &mut TproxyState) -> std::io::Result<()> {
     for bypass_ip in tproxy_args.bypass_ips.iter() {
         let args = &["delete", &bypass_ip.to_string()];
         if let Err(_err) = run_command("route", args) {
-            #[cfg(feature = "log")]
             log::debug!("command \"route {:?}\" error: {}", args, _err);
         }
     }
@@ -114,7 +113,6 @@ fn _tproxy_remove(state: &mut TproxyState) -> std::io::Result<()> {
         let bypass_ip = cidr::IpCidr::new_host(tproxy_args.proxy_addr.ip());
         let args = &["delete", &bypass_ip.to_string()];
         if let Err(_err) = run_command("route", args) {
-            #[cfg(feature = "log")]
             log::debug!("command \"route {:?}\" error: {}", args, _err);
         }
     }
@@ -123,7 +121,6 @@ fn _tproxy_remove(state: &mut TproxyState) -> std::io::Result<()> {
     // command: `route delete 0.0.0.0 mask 0.0.0.0`
     let args = &["delete", &unspecified, "mask", &unspecified];
     if let Err(_err) = run_command("route", args) {
-        #[cfg(feature = "log")]
         log::debug!("command \"route {:?}\" error: {}", args, _err);
     }
 
@@ -132,11 +129,11 @@ fn _tproxy_remove(state: &mut TproxyState) -> std::io::Result<()> {
     let original_gateway = original_gateway.to_string();
     let args = &["add", &unspecified, "mask", &unspecified, &original_gateway, "metric", "200"];
     if let Err(_err) = run_command("route", args) {
-        #[cfg(feature = "log")]
         log::debug!("command \"route {:?}\" error: {}", args, _err);
     }
 
     // remove the record file anyway
+    #[cfg(feature = "unsafe-state-file")]
     let _ = std::fs::remove_file(crate::get_state_file_path());
 
     flush_dns_cache()?;
