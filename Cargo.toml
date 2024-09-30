@@ -1,6 +1,6 @@
 [package]
 name = "tproxy-config"
-version = "5.0.4"
+version = "6.0.3"
 edition = "2021"
 description = "Transparent proxy configuration"
 license = "MIT"
@@ -11,18 +11,19 @@ readme = "readme.md"
 
 [features]
 default = []
-log = ["dep:log"]
+unsafe-state-file = []
 
 [dependencies]
 cidr = { version = "0.2", features = ["serde"] }
-log = { version = "0.4", optional = true }
-regex = "1.10"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+log = { version = "0.4" }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 resolv-conf = "0.7"
+system-configuration = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.29", features = ["fs", "mount", "process"] }
-tempfile = "3.10"
+tempfile = "3"

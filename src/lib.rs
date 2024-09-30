@@ -4,10 +4,7 @@ mod private_ip;
 mod tproxy_args;
 mod windows;
 
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
-};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 pub use {private_ip::is_private_ip, tproxy_args::TproxyArgs};
 
 pub use cidr::IpCidr;
@@ -95,9 +92,16 @@ pub struct TproxyState {
     pub(crate) restore_ip_forwarding: bool,
     #[cfg(target_os = "linux")]
     pub(crate) restore_socket_fwmark: Option<Vec<String>>,
+    #[cfg(target_os = "macos")]
+    pub(crate) default_service_id: Option<String>,
+    #[cfg(target_os = "macos")]
+    pub(crate) default_service_dns: Option<Vec<IpAddr>>,
+    #[cfg(target_os = "macos")]
+    pub(crate) orig_iface_name: Option<String>,
 }
 
 #[allow(dead_code)]
+#[cfg(feature = "unsafe-state-file")]
 pub(crate) fn store_intermediate_state(state: &TproxyState) -> std::io::Result<()> {
     let contents = serde_json::to_string(&state)?;
     std::fs::write(crate::get_state_file_path(), contents)?;
@@ -105,6 +109,7 @@ pub(crate) fn store_intermediate_state(state: &TproxyState) -> std::io::Result<(
 }
 
 #[allow(dead_code)]
+#[cfg(feature = "unsafe-state-file")]
 pub(crate) fn retrieve_intermediate_state() -> std::io::Result<TproxyState> {
     let path = crate::get_state_file_path();
     if !path.exists() {
