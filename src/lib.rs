@@ -1,3 +1,4 @@
+mod fn_holder;
 mod linux;
 mod macos;
 mod private_ip;
@@ -42,10 +43,19 @@ pub(crate) const ETC_RESOLV_CONF_FILE: &str = "/etc/resolv.conf";
 
 #[allow(dead_code)]
 pub(crate) fn run_command(command: &str, args: &[&str]) -> std::io::Result<Vec<u8>> {
-    let out = std::process::Command::new(command).args(args).output()?;
+    let full_cmd = format!("{} {}", command, args.join(" "));
+    log::trace!("Running command: \"{full_cmd}\"...");
+    let out = match std::process::Command::new(command).args(args).output() {
+        Ok(out) => out,
+        Err(e) => {
+            log::trace!("Run command: \"{full_cmd}\" failed with: {e}");
+            return Err(e);
+        }
+    };
     if !out.status.success() {
         let err = String::from_utf8_lossy(if out.stderr.is_empty() { &out.stdout } else { &out.stderr });
-        let info = format!("{} failed with: \"{}\"", command, err);
+        let info = format!("Run command: \"{full_cmd}\" failed with {err}");
+        log::trace!("{}", info);
         return Err(std::io::Error::new(std::io::ErrorKind::Other, info));
     }
     Ok(out.stdout)
@@ -127,7 +137,7 @@ pub(crate) fn compare_version(v1: &str, v2: &str) -> i32 {
     let split_parse = |ver: &str| -> Vec<i32> {
         ver.split('.')
             .filter_map(|s| s.parse::<i32>().ok())
-            .chain(std::iter::repeat(0).take(n))
+            .chain(std::iter::repeat_n(0, n))
             .collect()
     };
 

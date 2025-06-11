@@ -3,13 +3,13 @@
 use std::fs;
 use std::fs::Permissions;
 use std::net::IpAddr;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::str::FromStr;
 
 use cidr::IpCidr;
 
-use crate::{run_command, TproxyArgs, TproxyState, ETC_RESOLV_CONF_FILE};
+use crate::{ETC_RESOLV_CONF_FILE, TproxyArgs, TproxyState, run_command};
 
 fn bytes_to_string(bytes: Vec<u8>) -> std::io::Result<String> {
     match String::from_utf8(bytes) {
@@ -64,7 +64,7 @@ fn write_buffer_to_fd(fd: std::os::fd::BorrowedFd<'_>, data: &[u8]) -> std::io::
 fn write_nameserver(fd: std::os::fd::BorrowedFd<'_>, tun_gateway: Option<IpAddr>) -> std::io::Result<()> {
     let tun_gateway = tun_gateway.unwrap_or_else(|| "198.18.0.1".parse().unwrap());
     let data = format!("nameserver {}\n", tun_gateway);
-    nix::sys::stat::fchmod(fd.as_raw_fd(), nix::sys::stat::Mode::from_bits(0o444).unwrap())?;
+    nix::sys::stat::fchmod(fd.as_fd(), nix::sys::stat::Mode::from_bits(0o444).unwrap())?;
     write_buffer_to_fd(fd, data.as_bytes())?;
     Ok(())
 }
@@ -118,13 +118,13 @@ fn setup_resolv_conf(restore: &mut TproxyState) -> std::io::Result<()> {
 
         let flags = nix::fcntl::OFlag::O_WRONLY | nix::fcntl::OFlag::O_CLOEXEC | nix::fcntl::OFlag::O_TRUNC;
         let fd = nix::fcntl::open(ETC_RESOLV_CONF_FILE, flags, nix::sys::stat::Mode::from_bits(0o644).unwrap())?;
-        let fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
         write_nameserver(fd.as_fd(), tun_gateway)?;
     }
     Ok(())
 }
 
 fn route_show(is_ipv6: bool) -> std::io::Result<Vec<(IpCidr, Vec<String>)>> {
+    use std::io::{Error, ErrorKind::InvalidData};
     let route_show_args = if is_ipv6 {
         ["-6", "route", "show"]
     } else {
@@ -148,11 +148,18 @@ fn route_show(is_ipv6: bool) -> std::io::Result<Vec<(IpCidr, Vec<String>)>> {
         }
 
         let mut split = line.split_whitespace();
-        let mut dst_str = split.next().unwrap();
+        let mut dst_str = split
+            .next()
+            .ok_or(Error::new(InvalidData, format!("failed to parse route {}", line)))?;
 
         // NOTE: ignore routes like "multicast ff00::/8 dev eth1 metric 256"
         if dst_str == "multicast" {
-            // dst_str = split.next().unwrap();
+            // dst_str = split.next()..ok_or(Error::new(InvalidData, format!("failed to parse route {}", line)))?;
+            continue;
+        }
+
+        // if the first part of the route is "unreachable", we ignore it
+        if dst_str == "unreachable" {
             continue;
         }
 
@@ -165,7 +172,11 @@ fn route_show(is_ipv6: bool) -> std::io::Result<Vec<(IpCidr, Vec<String>)>> {
             Some((addr_str, prefix_len_str)) => (addr_str, prefix_len_str),
         };
 
-        let cidr: IpCidr = create_cidr(IpAddr::from_str(addr_str).unwrap(), u8::from_str(prefix_len_str).unwrap())?;
+        let addr = IpAddr::from_str(addr_str)
+            .map_err(|err| Error::new(InvalidData, format!("failed to parse IP address \"{}\": {}", addr_str, err)))?;
+        let len = u8::from_str(prefix_len_str)
+            .map_err(|err| Error::new(InvalidData, format!("failed to parse prefix len \"{}\": {}", prefix_len_str, err)))?;
+        let cidr: IpCidr = create_cidr(addr, len)?;
         let route_components: Vec<String> = split.map(String::from).collect();
         route_info.push((cidr, route_components));
     }
@@ -307,7 +318,8 @@ pub fn tproxy_setup(tproxy_args: &TproxyArgs) -> std::io::Result<TproxyState> {
         let args = &["route", "flush", "table", table];
         let _ = run_command("ip", args);
 
-        let default_route_components = get_route_components(&IpCidr::from_str("0.0.0.0/0").unwrap())?.unwrap();
+        let default_route_components = get_route_components(&IpCidr::from_str("0.0.0.0/0").unwrap())?
+            .ok_or_else(|| std::io::Error::other("failed to get default route components"))?;
         let mut args = vec!["route", "add", "table", table];
         args.extend(default_route_components.iter().map(|s| s.as_str()));
         run_command("ip", &args)?;

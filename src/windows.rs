@@ -1,12 +1,31 @@
 #![cfg(target_os = "windows")]
 
-use crate::{run_command, TproxyArgs, TproxyState};
-use std::net::{IpAddr, Ipv4Addr};
+use windows_sys::{
+    Win32::{
+        Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS, NO_ERROR, WIN32_ERROR},
+        NetworkManagement::{
+            IpHelper::{
+                ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToGuid, DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
+                DNS_SETTING_NAMESERVER, GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_INCLUDE_PREFIX, GetAdaptersAddresses, IF_TYPE_ETHERNET_CSMACD,
+                IF_TYPE_IEEE80211, IP_ADAPTER_ADDRESSES_LH,
+            },
+            Ndis::{IfOperStatusUp, NET_LUID_LH},
+        },
+        Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6},
+    },
+    core::GUID,
+};
+
+use crate::{TproxyArgs, TproxyState, run_command};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 pub fn tproxy_setup(tproxy_args: &TproxyArgs) -> std::io::Result<TproxyState> {
+    log::trace!("Setting up transparent proxy...");
+
     flush_dns_cache()?;
 
-    // 2. Route all traffic to the adapter, here the destination is adapter's gateway
+    log::trace!("Route all traffic to the gateway of adapter \"{}\"...", tproxy_args.tun_name);
+    // Route all traffic to the adapter, here the destination is adapter's gateway
     // command: `route add 0.0.0.0 mask 0.0.0.0 10.1.0.1 metric 6`
     let unspecified = if tproxy_args.tun_gateway.is_ipv4() {
         Ipv4Addr::UNSPECIFIED.to_string()
@@ -15,11 +34,12 @@ pub fn tproxy_setup(tproxy_args: &TproxyArgs) -> std::io::Result<TproxyState> {
     };
     let gateway = tproxy_args.tun_gateway.to_string();
     let args = &["add", &unspecified, "mask", &unspecified, &gateway, "metric", "6"];
-    log::info!("route {:?}", args);
     run_command("route", args)?;
 
-    let (original_gateway, _) = get_default_gateway()?;
+    log::trace!("Get default gateway...");
+    let original_gateway = get_default_gateway_ip()?;
 
+    log::trace!("Setting bypass IPs...");
     for bypass_ip in tproxy_args.bypass_ips.iter() {
         do_bypass_ip(*bypass_ip, original_gateway)?;
     }
@@ -28,12 +48,10 @@ pub fn tproxy_setup(tproxy_args: &TproxyArgs) -> std::io::Result<TproxyState> {
         do_bypass_ip(cidr, original_gateway)?;
     }
 
-    // 1. Setup the adapter's DNS
-    // command: `netsh interface ip set dns "utun3" static 10.0.0.1`
-    let tun_name = format!("\"{}\"", tproxy_args.tun_name);
-    let args = &["interface", "ip", "set", "dns", &tun_name, "static", &gateway];
-    log::info!("netsh {:?}", args);
-    run_command("netsh", args)?;
+    log::trace!("Setting \"{}\"'s DNS to {}...", tproxy_args.tun_name, tproxy_args.tun_gateway);
+    set_dns_server(&tproxy_args.tun_name, tproxy_args.tun_gateway)?;
+
+    log::trace!("Transparent proxy setup done");
 
     let state = TproxyState {
         tproxy_args: Some(tproxy_args.clone()),
@@ -54,7 +72,6 @@ fn do_bypass_ip(bypass_ip: cidr::IpCidr, original_gateway: IpAddr) -> std::io::R
     // route the bypass ip to the original gateway
     // command: `route add bypass_ip/24 original_gateway metric 1`
     let args = &["add", &bypass_ip.to_string(), &original_gateway.to_string(), "metric", "1"];
-    log::info!("route {:?}", args);
     run_command("route", args)?;
     Ok(())
 }
@@ -141,7 +158,67 @@ fn _tproxy_remove(state: &mut TproxyState) -> std::io::Result<()> {
     Ok(())
 }
 
+// NETIOAPI_API SetInterfaceDnsSettings(GUID Interface, const DNS_INTERFACE_SETTINGS *Settings);
+crate::define_fn_dynamic_load!(
+    SetInterfaceDnsSettingsDeclare,
+    unsafe extern "system" fn(interface: GUID, settings: *const DNS_INTERFACE_SETTINGS) -> WIN32_ERROR,
+    SET_INTERFACE_DNS_SETTINGS,
+    SetInterfaceDnsSettings,
+    "iphlpapi.dll",
+    "SetInterfaceDnsSettings"
+);
+
+pub(crate) fn set_dns_server(iface: &str, dns_server: IpAddr) -> std::io::Result<()> {
+    let Some(set_dns_fn) = SetInterfaceDnsSettings() else {
+        // command: `netsh interface ip set dns "utun3" static 10.0.0.1`
+        // or command: `powershell Set-DnsClientServerAddress -InterfaceAlias "utun3" -ServerAddresses ("10.0.0.1")`
+        let tun_name = format!("\"{}\"", iface);
+        let args = &["interface", "ip", "set", "dns", &tun_name, "static", &dns_server.to_string()];
+        run_command("netsh", args)?;
+        return Ok(());
+    };
+    let svr: Vec<u16> = dns_server.to_string().encode_utf16().chain(std::iter::once(0)).collect();
+    let settings = DNS_INTERFACE_SETTINGS {
+        Version: DNS_INTERFACE_SETTINGS_VERSION1,
+        Flags: DNS_SETTING_NAMESERVER as _,
+        NameServer: svr.as_ptr() as _,
+        Domain: std::ptr::null_mut(),
+        SearchList: std::ptr::null_mut(),
+        RegistrationEnabled: 0,
+        RegisterAdapterName: 0,
+        EnableLLMNR: 0,
+        QueryAdapterName: 0,
+        ProfileNameServer: std::ptr::null_mut(),
+    };
+
+    let luid = alias_to_luid(iface)?;
+    let guid = luid_to_guid(&luid)?;
+    let ret = unsafe { set_dns_fn(guid, &settings) };
+    if ret != NO_ERROR {
+        let err = std::io::Error::from_raw_os_error(ret as _);
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
 pub(crate) fn get_default_gateway() -> std::io::Result<(IpAddr, String)> {
+    let addr = get_default_gateway_ip()?;
+    let iface = get_default_gateway_interface()?;
+    Ok((addr, iface))
+}
+
+pub(crate) fn get_default_gateway_ip() -> std::io::Result<IpAddr> {
+    match get_active_network_interface_gateways().map(|gateways| gateways[0]) {
+        Ok(gateway) => Ok(gateway),
+        Err(e) => {
+            log::debug!("Failed to get default gateway by GetAdaptersAddresses: {}", e);
+            get_default_gateway_ip_by_cmd()
+        }
+    }
+}
+
+pub(crate) fn get_default_gateway_ip_by_cmd() -> std::io::Result<IpAddr> {
     let cmd = "Get-WmiObject -Class Win32_NetworkAdapterConfiguration -Filter IPEnabled=TRUE | ForEach-Object { $_.DefaultIPGateway }";
     let gateways = match run_command("powershell", &["-Command", cmd]) {
         Ok(gateways) => gateways,
@@ -173,11 +250,10 @@ pub(crate) fn get_default_gateway() -> std::io::Result<(IpAddr, String)> {
     }
 
     let err = std::io::Error::new(std::io::ErrorKind::Other, "No default gateway found");
-    let addr = ipv4_gateway.or(ipv6_gateway).ok_or(err)?;
-    let iface = get_default_gateway_interface()?;
-    Ok((addr, iface))
+    ipv4_gateway.or(ipv6_gateway).ok_or(err)
 }
 
+#[allow(dead_code)]
 pub(crate) fn get_default_gateway_interface() -> std::io::Result<String> {
     let cmd = "Get-WmiObject -Class Win32_NetworkAdapter | Where-Object { $_.NetConnectionStatus -eq 2 } | Select-Object -First 1 -ExpandProperty NetConnectionID";
     let iface = match run_command("powershell", &["-Command", cmd]) {
@@ -201,6 +277,109 @@ pub(crate) fn flush_dns_cache() -> std::io::Result<()> {
     Ok(())
 }
 
+pub fn alias_to_luid(alias: &str) -> std::io::Result<NET_LUID_LH> {
+    let alias = alias.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let mut luid = unsafe { std::mem::zeroed() };
+
+    match unsafe { ConvertInterfaceAliasToLuid(alias.as_ptr(), &mut luid) } {
+        0 => Ok(luid),
+        err => Err(std::io::Error::from_raw_os_error(err as _)),
+    }
+}
+
+pub fn luid_to_guid(luid: &NET_LUID_LH) -> std::io::Result<GUID> {
+    let mut guid = unsafe { std::mem::zeroed() };
+    match unsafe { ConvertInterfaceLuidToGuid(luid, &mut guid) } {
+        0 => Ok(guid),
+        err => Err(std::io::Error::from_raw_os_error(err as _)),
+    }
+}
+
+pub fn get_active_network_interface_gateways() -> std::io::Result<Vec<IpAddr>> {
+    let mut addrs = vec![];
+    get_adapters_addresses(|adapter| {
+        if adapter.OperStatus == IfOperStatusUp && [IF_TYPE_IEEE80211, IF_TYPE_ETHERNET_CSMACD].contains(&adapter.IfType) {
+            let mut current_gateway = adapter.FirstGatewayAddress;
+            while !current_gateway.is_null() {
+                let gateway = unsafe { &*current_gateway };
+                {
+                    let sockaddr_ptr = gateway.Address.lpSockaddr;
+                    let sockaddr = unsafe { &*(sockaddr_ptr as *const SOCKADDR) };
+                    let a = unsafe { sockaddr_to_socket_addr(sockaddr) }?;
+                    addrs.insert(0, a.ip());
+                }
+                current_gateway = gateway.Next;
+            }
+        }
+        Ok(())
+    })?;
+    if addrs.is_empty() {
+        Err(std::io::Error::new(std::io::ErrorKind::Other, "No gateway found"))
+    } else {
+        Ok(addrs)
+    }
+}
+
+pub(crate) fn get_adapters_addresses<F>(mut callback: F) -> std::io::Result<()>
+where
+    F: FnMut(IP_ADAPTER_ADDRESSES_LH) -> std::io::Result<()>,
+{
+    let mut size = 0;
+    let flags = GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_INCLUDE_GATEWAYS;
+    let family = AF_UNSPEC as u32;
+
+    // Make an initial call to GetAdaptersAddresses to get the
+    // size needed into the size variable
+    let result = unsafe { GetAdaptersAddresses(family, flags, std::ptr::null_mut(), std::ptr::null_mut(), &mut size) };
+
+    if result != ERROR_BUFFER_OVERFLOW {
+        return Err(std::io::Error::from_raw_os_error(result as _));
+    }
+    // Allocate memory for the buffer
+    let mut addresses: Vec<u8> = vec![0; (size + 4) as usize];
+
+    // Make a second call to GetAdaptersAddresses to get the actual data we want
+    let addrs = addresses.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
+    let result = unsafe { GetAdaptersAddresses(family, flags, std::ptr::null_mut(), addrs, &mut size) };
+
+    if ERROR_SUCCESS != result {
+        return Err(std::io::Error::from_raw_os_error(result as _));
+    }
+
+    // If successful, output some information from the data we received
+    let mut current_addresses = addresses.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+    while !current_addresses.is_null() {
+        unsafe {
+            callback(*current_addresses)?;
+            current_addresses = (*current_addresses).Next;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) unsafe fn sockaddr_to_socket_addr(sock_addr: *const SOCKADDR) -> std::io::Result<SocketAddr> {
+    use std::io::{Error, ErrorKind};
+    let address = match (unsafe { *sock_addr }).sa_family {
+        AF_INET => unsafe { sockaddr_in_to_socket_addr(&*(sock_addr as *const SOCKADDR_IN)) },
+        AF_INET6 => unsafe { sockaddr_in6_to_socket_addr(&*(sock_addr as *const SOCKADDR_IN6)) },
+        _ => return Err(Error::new(ErrorKind::Other, "Unsupported address type")),
+    };
+    Ok(address)
+}
+
+pub(crate) unsafe fn sockaddr_in_to_socket_addr(sockaddr_in: &SOCKADDR_IN) -> SocketAddr {
+    let ip_bytes = unsafe { sockaddr_in.sin_addr.S_un.S_addr.to_ne_bytes() };
+    let ip = std::net::IpAddr::from(ip_bytes);
+    let port = u16::from_be(sockaddr_in.sin_port);
+    SocketAddr::new(ip, port)
+}
+
+pub(crate) unsafe fn sockaddr_in6_to_socket_addr(sockaddr_in6: &SOCKADDR_IN6) -> SocketAddr {
+    let ip = std::net::IpAddr::from(unsafe { sockaddr_in6.sin6_addr.u.Byte });
+    let port = u16::from_be(sockaddr_in6.sin6_port);
+    SocketAddr::new(ip, port)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +388,8 @@ mod tests {
     fn test_get_default_gateway() {
         let (addr, iface) = get_default_gateway().unwrap();
         println!("addr: {:?}, iface: {}", addr, iface);
+
+        let gw = get_active_network_interface_gateways().unwrap();
+        println!("gateways: {:?}", gw);
     }
 }
